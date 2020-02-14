@@ -1,0 +1,245 @@
+---
+title: "lab 6"
+author: "Ruoyu Wang"
+date: "2020/2/13"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+# attach packages
+library(tidyverse)
+library(here)
+library(janitor)
+library(raster)
+library(sf)
+library(tmap)
+library(tmaptools)
+library(gstat)
+```
+
+## grand canyon DeoTIFF
+
+```{r}
+gc_dem <- raster::raster(here::here("data", "gc_dem.tif"))
+
+# look at it using plot()
+# plot(gc_dem)
+
+# Check the CRS: coordinate system
+# gc_dem@crs
+# it's wired because it shows in meters not long/latitude
+
+# check the extent (bounding box):
+# gc_dem@extent
+
+# update crs, creating a wgs84 w/latlong:
+wgs84 = "+proj=longlat +datum=WGS84 +ellps=WGS84 +no_defs" # Just have this ready to copy/paste
+
+gc_reproj = projectRaster(gc_dem, crs = wgs84, method = "bilinear")
+  
+gc_reproj@extent
+```
+
+### crop raster to a smaller area (bounding box):
+```{r}
+bounds <- as(extent(-122.4, -112.0, 36.1, 36.3), 'SpatialPolygons')
+```
+
+### Make the CRS of our bounding box the same as thr gc_reproj
+```{r}
+crs(bounds) <- crs(gc_reproj)
+```
+
+### now le's crop our original sparial data:
+```{r}
+gc_crop <- crop(gc_reproj, bounds)
+
+plot(gc_crop)
+```
+
+### Resample using the `aggregate` function:
+```{r}
+gc_agg <- raster::aggregate(gc_crop, fact = 50)
+gc_agg2 <- raster::aggregate(gc_crop, fact = 10)
+
+plot(gc_agg)
+plot(gc_agg2)
+```
+
+### now let's get safe and sound in ggplot
+first, convert data to a data frame:
+```{r}
+gc_df <- as.data.frame(gc_agg, xy=TRUE)
+
+ggplot(data = gc_df, aes(x = x, y = y))+
+  geom_raster(aes(fill = gc_dem))+
+  coord_quickmap()+
+  theme_minimal()+
+  scale_fill_gradientn(colors = c(
+    "purple", "red","magenta","yellow","white"
+  ))
+```
+
+### How can I just select cells that match viven criteria?
+
+i have some species of vegatation that will only grow when gc_dem is between 1000 and 1500
+
+```{r}
+gc_hab <- gc_crop
+
+# set any cells outside of (1000 - 1500) to NA
+gc_hab[gc_hab > 1500 | gc_hab < 1000] <- NA
+
+plot(gc_hab)
+
+```
+
+now let's make this interactive with tmap:
+```{r}
+tmap_mode("view")
+
+tm_shape(gc_hab)+
+  tm_raster(legend.show = FALSE, palette = "plasma")
+```
+
+### kriging rain in kansas
+
+Read in the KS counties shapefile data
+```{r}
+ks_counties <- read_sf(here::here("data", "ks_counties", "ks_counties_shapefile.shp"))
+
+# use base plot:
+plot(ks_counties)
+
+# Check CRS
+st_crs(ks_counties) # no crs, we should set one
+
+# set to EPSG 4326:
+st_crs(ks_counties) <- 4326
+
+plot(ks_counties)
+```
+
+practice in ggplot:
+```{r}
+ggplot(data = ks_counties)+
+  geom_sf()
+```
+
+
+Now let's read in the rainfall data
+```{r}
+ks_rain <- read_csv(here("data", "ks_rain.csv")) %>% 
+  clean_names()
+```
+
+update the ks_rain data to be recognized as spatial points:
+```{r}
+ks_sf <- st_as_sf(ks_rain, coords = c("lon", "lat"), crs = 4326) # has to be in long/lat order
+```
+
+
+```{r}
+ggplot() +
+  geom_sf(data = ks_counties)+
+  geom_sf(data = ks_sf,
+          aes(color = amt, size = amt),
+          show.legend = FALSE)+
+  theme_minimal()
+```
+
+## kriging to predict rainfall:
+```{r}
+ks_sp <- as_Spatial(ks_sf)
+class(ks_sp)
+```
+
+### make a spatial pixels grid that we'll make predictions over:
+```{r}
+# bbox(ks_sp)
+#   min    max
+# coords.x1 -101.75 -94.63
+# coords.x2   37.00  40.00
+
+lat <- seq(37, 40, length.out = 200)
+long <- seq(-94.6, -102, length.out = 200)
+
+# now we're going to make this into a spatial grid:
+grid <- expand.grid(lon = long, lat = lat)
+grid_sf <- st_as_sf(grid, coords = c("lon", "lat"), crs = 4326)
+grid_sp <- as_Spatial(grid_sf)
+
+plot(grid_sp)
+```
+
+### Now make a variogram
+```{r}
+ks_vgm <- variogram(amt ~ 1, data = ks_sp)
+plot(ks_vgm)
+
+# My estimates for variogram parameters:
+# nugget = 0.2
+# sill = 0.8
+# range = 200
+
+ks_vgm_fit <- fit.variogram(ks_vgm, model = vgm(nugget = 0.1, psill = 0.8, range = 200, model = "Sph")) # other models: "Exp", "Gau"
+
+ks_vgm_fit
+# nug: 0.102, sill: 0.954, range: 235.142
+
+plot(ks_vgm, ks_vgm_fit)
+```
+
+### now, krige!
+```{r}
+ks_krige <- krige(amt ~ 1, ks_sp, grid_sp, model = ks_vgm_fit)
+
+ks_krige@data
+# for each cell, it has a predicted value and variances
+```
+
+```{r}
+spplot(ks_krige, "var1.pred")
+# cute with a heart!
+```
+
+### Make a data frame of kriged predictions
+```{r}
+ks_df <- data.frame(ks_krige@data["var1.pred"],
+                    ks_krige@data["var1.var"],
+                    ks_krige@coords) %>% 
+  rename(longitude = coords.x1,
+         latitude = coords.x2)
+
+# converting this data object
+rain_sf <- st_as_sf(ks_df, coords = c("longitude", "latitude"), crs = 4326)
+
+ggplot(rain_sf)+
+  geom_sf(aes(color = var1.pred))
+```
+
+# crop to the actual KS outline
+```{r}
+ks <- read_sf(dsn = here::here("data", "states"), layer = "cb_2017_us_state_20m") %>% 
+  dplyr::select(NAME) %>% 
+  filter(NAME == "Kansas") %>% 
+  st_transform(crs = 4326)
+
+plot(ks)
+```
+
+```{r}
+# find the intersection of the two:
+rain_sf_ks <- st_intersection(rain_sf, ks)
+
+# plot
+ggplot(data = rain_sf_ks)+
+  geom_sf(aes(color = var1.pred))
+```
+
+
+
+
